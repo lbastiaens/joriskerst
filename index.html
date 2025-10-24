@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MQTT Kleurkiezer</title>
+    <!-- Load Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Configure Tailwind for Inter font -->
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body {
+            font-family: 'Inter', sans-serif;
+            background-color: #f7f7f7;
+        }
+        /* Custom styling for the color input to make it large and round */
+        #colorPicker {
+            -webkit-appearance: none;
+            -moz-appearance: none;
+            appearance: none;
+            background: none;
+            border: none;
+            width: 100%;
+            height: 150px;
+            cursor: pointer;
+            border-radius: 1.5rem; /* Large rounded corners */
+            padding: 0;
+            overflow: hidden; /* Ensures the color fills the rounded area */
+        }
+        /* Remove default color picker border on focus */
+        #colorPicker::-webkit-color-swatch-wrapper {
+            padding: 0;
+        }
+        #colorPicker::-webkit-color-swatch {
+            border: none;
+            border-radius: 1.5rem;
+        }
+        #colorPicker::-moz-color-swatch-wrapper {
+            padding: 0;
+        }
+        #colorPicker::-moz-color-swatch {
+            border: none;
+            border-radius: 1.5rem;
+        }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+
+    <!-- Main Container Card -->
+    <div class="w-full max-w-md bg-white p-6 md:p-8 rounded-2xl shadow-xl space-y-6">
+        <h1 class="text-3xl font-bold text-center text-gray-800">Kleurkiezer voor Kerst</h1>
+        <p class="text-center text-gray-500 mb-6">Selecteer een kleur en pas deze direct toe op het MQTT-kanaal `joriskerst`.</p>
+
+        <!-- Color Picker and Connection Status -->
+        <div class="flex flex-col items-center space-y-4">
+            <label for="colorPicker" class="text-lg font-medium text-gray-700">Gekozen Kleur:</label>
+            <input type="color" id="colorPicker" value="#0056D6">
+        </div>
+
+        <!-- Status Box -->
+        <div id="statusBox" class="text-center text-sm p-3 rounded-xl font-medium transition-all duration-300 bg-yellow-100 text-yellow-700">
+            Verbinden met MQTT-broker...
+        </div>
+
+        <!-- Action Button -->
+        <button id="publishButton" disabled
+                class="w-full py-4 text-lg font-semibold rounded-xl transition duration-200 ease-in-out disabled:opacity-50 disabled:cursor-not-allowed
+                       bg-blue-600 hover:bg-blue-700 text-white shadow-lg shadow-blue-500/50">
+            Kleur aanpassen!
+        </button>
+
+        <p class="text-xs text-center text-gray-400 pt-2">
+            Broker: test.mosquitto.org (poort 8081, WSS) | Topic: joriskerst
+        </p>
+    </div>
+
+    <!-- Load Paho MQTT JavaScript Client for WebSockets -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js"></script>
+
+    <script>
+        // --- Global MQTT Setup ---
+        const host = "test.mosquitto.org";
+        const port = 8081; // FIX: Changed from 8884 to 8081 (Secure WebSocket port for test.mosquitto.org)
+        const path = ""; 
+        const topic = "joriskerst";
+        
+        // Generate a unique client ID
+        const clientId = "web_color_picker_" + Math.random().toString(16).substr(2, 8);
+        
+        let client;
+        
+        // --- DOM Elements ---
+        const statusBox = document.getElementById('statusBox');
+        const publishButton = document.getElementById('publishButton');
+        const colorPicker = document.getElementById('colorPicker');
+
+        /**
+         * Updates the status message displayed to the user.
+         * @param {string} message - The message to display.
+         * @param {string} type - The type of message ('info', 'success', 'error').
+         */
+        function updateStatus(message, type = 'info') {
+            statusBox.textContent = message;
+            statusBox.classList.remove('bg-yellow-100', 'text-yellow-700', 'bg-green-100', 'text-green-700', 'bg-red-100', 'text-red-700');
+
+            switch (type) {
+                case 'success':
+                    statusBox.classList.add('bg-green-100', 'text-green-700');
+                    publishButton.disabled = false;
+                    break;
+                case 'error':
+                    statusBox.classList.add('bg-red-100', 'text-red-700');
+                    publishButton.disabled = true;
+                    break;
+                case 'info':
+                default:
+                    statusBox.classList.add('bg-yellow-100', 'text-yellow-700');
+                    publishButton.disabled = true;
+                    break;
+            }
+        }
+
+        /**
+         * Connects the Paho MQTT client to the broker.
+         */
+        function mqttConnect() {
+            try {
+                // Initialize the client object (using WebSocket protocol)
+                client = new Paho.MQTT.Client(host, port, path, clientId);
+
+                // Set callback handlers
+                client.onConnectionLost = onConnectionLost;
+                
+                // Connect the client
+                updateStatus("Verbinden met MQTT-broker...");
+                client.connect({
+                    onSuccess: onConnect,
+                    onFailure: onFailure,
+                    cleanSession: true, // Start a fresh session
+                    useSSL: true, // Use WSS protocol
+                });
+            } catch (e) {
+                console.error("MQTT Initialization Error:", e);
+                updateStatus(`Fout bij initialisatie: ${e.message}`, 'error');
+            }
+        }
+
+        /**
+         * Called when the connection is established.
+         */
+        function onConnect() {
+            console.log("MQTT Connected");
+            updateStatus("Verbinding gelukt! Klaar om te publiceren.", 'success');
+        }
+
+        /**
+         * Called when the connection fails.
+         */
+        function onFailure(responseObject) {
+            console.error("MQTT Connection Failed:", responseObject);
+            updateStatus(`Verbindingsfout: ${responseObject.errorMessage}. Opnieuw proberen in 5s.`, 'error');
+            // Attempt to reconnect after a delay
+            setTimeout(mqttConnect, 5000); 
+        }
+
+        /**
+         * Called when the connection is lost.
+         */
+        function onConnectionLost(responseObject) {
+            if (responseObject.reconnect) {
+                updateStatus("Verbinding verbroken. Probeer opnieuw te verbinden...", 'info');
+            } else {
+                updateStatus(`Verbinding definitief verbroken: ${responseObject.errorMessage}.`, 'error');
+            }
+        }
+
+        /**
+         * Publishes the current color hex value to the MQTT topic.
+         */
+        function publishColor() {
+            if (!client || !client.isConnected()) {
+                updateStatus("Niet verbonden. Opnieuw verbinding maken...", 'error');
+                mqttConnect(); // Try to reconnect
+                return;
+            }
+
+            // Get the hex color value (e.g., "#FF00AA")
+            const hexValue = colorPicker.value; 
+
+            // Create the MQTT message
+            const message = new Paho.MQTT.Message(hexValue);
+            message.destinationName = topic;
+            message.qos = 0; // Quality of Service 0 (fire and forget)
+            message.retained = false; // Do not retain the message on the broker
+
+            try {
+                client.send(message);
+                updateStatus(`Kleur (${hexValue}) succesvol verzonden!`, 'success');
+                console.log(`Published to ${topic}: ${hexValue}`);
+
+                // Briefly show success then revert status
+                setTimeout(() => {
+                    if (statusBox.textContent.includes("succesvol verzonden")) {
+                        updateStatus("Verbinding gelukt! Klaar om te publiceren.", 'success');
+                    }
+                }, 2000);
+
+            } catch (e) {
+                console.error("MQTT Publish Error:", e);
+                updateStatus(`Fout bij verzenden: ${e.message}`, 'error');
+            }
+        }
+
+        // --- Event Listeners and Initialization ---
+        
+        // 1. Initialize the MQTT connection when the page loads
+        window.onload = mqttConnect;
+
+        // 2. Attach the publish function to the button
+        publishButton.addEventListener('click', publishColor);
+
+    </script>
+
+</body>
+</html>
