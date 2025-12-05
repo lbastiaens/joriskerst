@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Hornet Scout</title>
+    <!-- Tailwind CSS for modern, responsive styling -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        /* Custom styles for the fixed canvas and video area */
+        .camera-container {
+            position: relative;
+            width: 100%;
+            /* Maintain aspect ratio or set a fixed height */
+            height: 70vh; /* 70% of viewport height */
+            background-color: #1f2937;
+            border-radius: 0.75rem;
+            overflow: hidden;
+            box-shadow: 0 10px 15px rgba(0, 0, 0, 0.2);
+        }
+        video, canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            object-fit: cover; /* Ensures camera feed fills the container */
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 10;
+        }
+        #overlayCanvas {
+            z-index: 20; /* Overlay on top of the video */
+            opacity: 0.8;
+            pointer-events: none; /* Allows clicks to pass through to the buttons */
+        }
+        .status-message {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            z-index: 30;
+            padding: 1rem;
+            background-color: rgba(0, 0, 0, 0.7);
+            color: #fff;
+            border-radius: 0.5rem;
+            min-width: 80%;
+            text-align: center;
+        }
+        .hornet-detected {
+            animation: pulse-red 1s infinite alternate;
+        }
+        @keyframes pulse-red {
+            from { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.7); }
+            to { box-shadow: 0 0 20px 10px rgba(239, 68, 68, 1); }
+        }
+    </style>
+    <!-- TensorFlow.js Library -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@3.13.0/dist/tf.min.js"></script>
+    <!-- COCO-SSD Model (used as a lightweight detection placeholder) -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd"></script>
+    <!-- Paho MQTT JavaScript Client for WebSockets -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/paho-mqtt/1.0.1/mqttws31.min.js" type="text/javascript"></script>
+</head>
+<body class="bg-gray-100 text-gray-800 font-sans min-h-screen p-4 flex flex-col items-center">
+
+    <header class="w-full max-w-lg mb-4">
+        <h1 class="text-3xl font-bold text-center text-indigo-700">Hornet Scout 🐝</h1>
+        <p class="text-sm text-center text-gray-500">Continuous 2 FPS Monitoring (Client-Side ML)</p>
+    </header>
+
+    <main class="w-full max-w-lg">
+        <div id="cameraContainer" class="camera-container mb-4">
+            <video id="webcamVideo" autoplay muted playsinline></video>
+            <!-- Canvas for drawing bounding boxes (if needed) and capturing frames for ML -->
+            <canvas id="captureCanvas" class="hidden"></canvas>
+            <canvas id="overlayCanvas"></canvas>
+            <div id="statusMessage" class="status-message">Loading Model...</div>
+        </div>
+
+        <div class="p-4 bg-white rounded-xl shadow-lg">
+            <h2 class="text-lg font-semibold mb-2 text-indigo-700">System Status</h2>
+            <p id="systemStatus" class="text-sm text-gray-600 mb-4">Awaiting initialization...</p>
+
+            <h2 class="text-lg font-semibold mb-2 text-indigo-700">MQTT Settings</h2>
+            <div class="flex flex-col space-y-2">
+                <input type="text" id="brokerUrl" value="broker.hivemq.com" placeholder="Broker URL" class="p-2 border border-gray-300 rounded-lg">
+                <input type="number" id="brokerPort" value="8000" placeholder="Port (e.g., 8000 for WS)" class="p-2 border border-gray-300 rounded-lg">
+                <input type="text" id="topic" value="hornet-watch/alerts" placeholder="MQTT Topic" class="p-2 border border-gray-300 rounded-lg">
+            </div>
+
+            <button id="startButton" class="w-full mt-4 py-3 bg-indigo-600 hover:bg-indigo-700 text-white font-bold rounded-lg shadow-md transition duration-150" disabled>
+                Start Monitoring (2 FPS)
+            </button>
+        </div>
+        
+        <div class="mt-4 p-4 bg-white rounded-xl shadow-lg">
+            <h2 class="text-lg font-semibold mb-2 text-indigo-700">Activity Log</h2>
+            <ul id="log" class="text-xs text-gray-700 space-y-1 h-32 overflow-y-scroll border border-gray-200 p-2 rounded-lg bg-gray-50">
+                <!-- Log messages will appear here -->
+            </ul>
+        </div>
+    </main>
+
+    <script>
+        // --- Configuration ---
+        const CAMERA_FPS = 2; // Target frame rate: 1 or 2 FPS (500ms interval)
+        const DETECTION_INTERVAL_MS = 1000 / CAMERA_FPS;
+        const TARGET_CLASS = 'mouse'; // Placeholder: In a real app, this is a custom model class like 'asian_hornet'
+        const MIN_CONFIDENCE = 0.65; // Minimum confidence to trigger an alert
+
+        // --- Global Variables ---
+        let model = null;
+        let mqttClient = null;
+        let monitoringInterval = null;
+        let isMqttConnected = false;
+
+        const video = document.getElementById('webcamVideo');
+        const canvas = document.getElementById('captureCanvas');
+        const overlayCanvas = document.getElementById('overlayCanvas');
+        const statusMessage = document.getElementById('statusMessage');
+        const systemStatus = document.getElementById('systemStatus');
+        const logList = document.getElementById('log');
+        const startButton = document.getElementById('startButton');
+        const brokerUrlInput = document.getElementById('brokerUrl');
+        const brokerPortInput = document.getElementById('brokerPort');
+        const topicInput = document.getElementById('topic');
+
+        /**
+         * Utility function to log messages to the UI and console.
+         * @param {string} message - The message to log.
+         * @param {string} type - 'info', 'success', 'error', 'alert'.
+         */
+        function log(message, type = 'info') {
+            console.log(`[${type.toUpperCase()}] ${message}`);
+            const li = document.createElement('li');
+            const now = new Date().toLocaleTimeString();
+            li.innerHTML = `<span class="font-mono text-xs text-gray-400 mr-2">${now}</span>${message}`;
+            
+            if (type === 'error') li.className = 'text-red-500 font-semibold';
+            else if (type === 'success') li.className = 'text-green-600';
+            else if (type === 'alert') li.className = 'text-yellow-600 font-bold';
+            
+            logList.prepend(li); // Add to the top
+            // Keep log size limited
+            while (logList.children.length > 20) {
+                logList.removeChild(logList.lastChild);
+            }
+        }
+
+        // --- 1. Model & Camera Setup ---
+
+        /**
+         * Initializes the ML model and camera stream.
+         */
+        async function initialize() {
+            try {
+                // 1. Load the ML Model
+                statusMessage.textContent = 'Loading ML Model...';
+                log('Loading TensorFlow.js COCO-SSD model (placeholder for custom hornet model)...');
+                model = await cocoSsd.load(); // Quick and lightweight model
+                log('ML Model Loaded successfully!', 'success');
+                statusMessage.textContent = 'Model Loaded. Waiting for Camera...';
+                systemStatus.textContent = 'Model Ready. Please enable camera.';
+
+                // 2. Start Camera
+                await setupCamera();
+                
+                // 3. Setup MQTT Client
+                setupMqttClient();
+                
+                // 4. Enable Start Button
+                startButton.disabled = false;
+                startButton.textContent = 'Start Monitoring (2 FPS)';
+
+            } catch (error) {
+                const errMsg = `Initialization failed: ${error.message}. Ensure camera/mic access is granted.`;
+                log(errMsg, 'error');
+                statusMessage.textContent = errMsg;
+            }
+        }
+
+        /**
+         * Gets the user's camera feed and attaches it to the video element.
+         */
+        async function setupCamera() {
+            try {
+                // Request back camera on mobile devices for better field of view
+                const constraints = {
+                    video: {
+                        facingMode: 'environment', // Use the rear camera
+                        width: { ideal: 640 },
+                        height: { ideal: 480 }
+                    }
+                };
+                const stream = await navigator.mediaDevices.getUserMedia(constraints);
+                video.srcObject = stream;
+                
+                // Wait for the video to load metadata to get actual dimensions
+                await new Promise(resolve => video.onloadedmetadata = resolve);
+
+                // Set canvas dimensions to match video stream
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                overlayCanvas.width = video.videoWidth;
+                overlayCanvas.height = video.videoHeight;
+
+                log('Camera stream loaded and ready.', 'success');
+                statusMessage.textContent = 'Camera Ready. Click START to begin monitoring.';
+            } catch (error) {
+                log(`Camera access failed: ${error.name}. Please check permissions.`, 'error');
+                statusMessage.textContent = 'Camera Blocked or Not Found.';
+                startButton.disabled = true;
+            }
+        }
+
+        // --- 2. MQTT Communication Setup ---
+
+        /**
+         * Sets up the Paho MQTT Client connection.
+         */
+        function setupMqttClient() {
+            const host = brokerUrlInput.value;
+            const port = parseInt(brokerPortInput.value);
+            const clientId = "HornetScoutClient_" + Date.now(); // Unique ID
+
+            try {
+                // Paho.MQTT.Client(host, port, path, clientId)
+                // Use WebSockets connection for browser (port 8000 for HiveMQ test broker)
+                mqttClient = new Paho.MQTT.Client(host, port, "/ws", clientId); 
+                
+                mqttClient.onConnectionLost = onConnectionLost;
+                mqttClient.onMessageArrived = onMessageArrived; // Not used for publishing, but good practice
+
+                log(`Attempting to connect to MQTT broker: ws://${host}:${port}`, 'info');
+
+                const connectOptions = {
+                    useSSL: false, // Set to true if using wss:// and correct port
+                    timeout: 3,
+                    onSuccess: onConnect,
+                    onFailure: onConnectFailure
+                };
+                
+                mqttClient.connect(connectOptions);
+            } catch (error) {
+                log(`Failed to initialize MQTT client: ${error.message}`, 'error');
+            }
+        }
+
+        function onConnect() {
+            isMqttConnected = true;
+            log('Successfully connected to MQTT broker.', 'success');
+            systemStatus.textContent = 'Model Ready | MQTT Connected';
+        }
+
+        function onConnectFailure(response) {
+            log(`MQTT Connection failed: ${response.errorMessage}. Retrying in 5s.`, 'error');
+            isMqttConnected = false;
+            systemStatus.textContent = 'Model Ready | MQTT DISCONNECTED';
+            // Simple retry logic
+            setTimeout(setupMqttClient, 5000); 
+        }
+
+        function onConnectionLost(responseObject) {
+            isMqttConnected = false;
+            if (responseObject.errorCode !== 0) {
+                log(`MQTT Connection Lost: ${responseObject.errorMessage}. Attempting to reconnect...`, 'error');
+            }
+            systemStatus.textContent = 'Model Ready | MQTT DISCONNECTED';
+            // Attempt to reconnect immediately
+            mqttClient.connect({ onSuccess: onConnect, onFailure: onConnectFailure });
+        }
+
+        function onMessageArrived(message) {
+            // This client only publishes, but we can log incoming messages if needed
+            // log(`MQTT Message Received: ${message.payloadString} on topic ${message.destinationName}`);
+        }
+
+        /**
+         * Sends an MQTT message with hornet detection data and GPS.
+         * @param {Object} detection - The ML detection result.
+         */
+        function sendAlert(detection) {
+            if (!isMqttConnected) {
+                log('MQTT client is not connected. Cannot send alert.', 'error');
+                return;
+            }
+
+            // 1. Get high-accuracy GPS location
+            navigator.geolocation.getCurrentPosition(
+                (position) => {
+                    const { latitude, longitude, accuracy } = position.coords;
+                    const timestamp = new Date().toISOString();
+                    
+                    // 2. Construct the Payload
+                    const payload = {
+                        timestamp_utc: timestamp,
+                        latitude: latitude,
+                        longitude: longitude,
+                        gps_accuracy_m: accuracy,
+                        detection: {
+                            object: 'Asian Hornet', // Actual class name from custom model
+                            confidence: detection.score.toFixed(4),
+                            // Optional: Bounding box data
+                            bbox: detection.bbox 
+                        }
+                    };
+
+                    const messageString = JSON.stringify(payload);
+                    const topic = topicInput.value;
+                    
+                    // 3. Publish the message
+                    const message = new Paho.MQTT.Message(messageString);
+                    message.destinationName = topic;
+                    message.qos = 1; // At least once delivery assurance
+
+                    try {
+                        mqttClient.send(message);
+                        log(`ALERT SENT: Hornet detected at ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`, 'alert');
+                        // Briefly pulse the container red on successful send
+                        document.getElementById('cameraContainer').classList.add('hornet-detected');
+                        setTimeout(() => {
+                            document.getElementById('cameraContainer').classList.remove('hornet-detected');
+                        }, 500);
+
+                    } catch (error) {
+                        log(`MQTT Publish Failed: ${error.message}`, 'error');
+                    }
+                },
+                (error) => {
+                    log(`GPS Error: ${error.message}. Alert not sent.`, 'error');
+                },
+                {
+                    enableHighAccuracy: true, // Crucial for precise GPS
+                    timeout: 5000,
+                    maximumAge: 0
+                }
+            );
+        }
+
+        // --- 3. ML Detection Loop ---
+
+        /**
+         * The core function that runs the detection loop at a controlled FPS.
+         */
+        async function detectHornet() {
+            if (!model || video.readyState !== 4) {
+                // Model not ready or video stream not fully loaded
+                return;
+            }
+
+            // Using tf.tidy to clean up Tensors immediately after inference
+            const predictions = tf.tidy(() => {
+                // 1. Capture frame from video to canvas
+                const ctx = canvas.getContext('2d');
+                ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+                
+                // 2. Run Inference
+                // The cocoSsd.detect method handles conversion from the video/canvas element to Tensor
+                return model.detect(canvas, 10, MIN_CONFIDENCE);
+            });
+            
+            // Wait for prediction results
+            const results = await predictions;
+
+            // 3. Check for the Target (Hornet)
+            const hornetAlerts = results.filter(p => 
+                p.class === TARGET_CLASS && p.score > MIN_CONFIDENCE
+            );
+
+            if (hornetAlerts.length > 0) {
+                const bestDetection = hornetAlerts[0];
+                log(`FOUND! Score: ${bestDetection.score.toFixed(2)}`, 'alert');
+                sendAlert(bestDetection);
+                drawBoundingBox(bestDetection);
+            } else {
+                // Clear bounding box if no detection
+                const ctx = overlayCanvas.getContext('2d');
+                ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+            }
+            
+            // Mandatory: Dispose of the tensors created by the model.detect internal logic
+            // In this case, cocoSsd.detect generally handles cleanup, but we use tf.tidy above 
+            // to ensure maximum memory management.
+
+            // Request the next frame in the controlled loop
+            // The setInterval manages the FPS, so no rAF or manual next frame request needed.
+        }
+
+        /**
+         * Draws a bounding box on the overlay canvas for visual confirmation.
+         * @param {Object} prediction - The single best detection object.
+         */
+        function drawBoundingBox(prediction) {
+            const ctx = overlayCanvas.getContext('2d');
+            ctx.clearRect(0, 0, overlayCanvas.width, overlayCanvas.height);
+
+            const [x, y, width, height] = prediction.bbox;
+
+            ctx.strokeStyle = '#EF4444'; // Tailwind red-500
+            ctx.lineWidth = 4;
+            ctx.strokeRect(x, y, width, height);
+
+            ctx.fillStyle = '#EF4444';
+            ctx.fillRect(x, y - 25, 100, 25);
+            ctx.fillStyle = '#FFFFFF';
+            ctx.font = '16px Inter, sans-serif';
+            ctx.fillText(`Hornet: ${prediction.score.toFixed(2)}`, x + 5, y - 8);
+        }
+
+        // --- Event Listeners and Start/Stop Logic ---
+
+        startButton.addEventListener('click', () => {
+            if (monitoringInterval) {
+                // Stop monitoring
+                clearInterval(monitoringInterval);
+                monitoringInterval = null;
+                startButton.textContent = 'Start Monitoring (2 FPS)';
+                startButton.classList.remove('bg-red-600', 'hover:bg-red-700');
+                startButton.classList.add('bg-indigo-600', 'hover:bg-indigo-700');
+                systemStatus.textContent = 'Monitoring Paused | ' + (isMqttConnected ? 'MQTT Connected' : 'MQTT DISCONNECTED');
+                log('Monitoring stopped.', 'info');
+            } else {
+                // Start monitoring
+                log(`Starting detection loop at ${CAMERA_FPS} FPS...`, 'info');
+                monitoringInterval = setInterval(detectHornet, DETECTION_INTERVAL_MS);
+                startButton.textContent = 'Stop Monitoring';
+                startButton.classList.remove('bg-indigo-600', 'hover:bg-indigo-700');
+                startButton.classList.add('bg-red-600', 'hover:bg-red-700');
+                systemStatus.textContent = 'MONITORING ACTIVE | ' + (isMqttConnected ? 'MQTT Connected' : 'MQTT DISCONNECTED');
+                statusMessage.textContent = 'Monitoring Active...';
+            }
+        });
+
+        // Initialize the application when the window loads
+        window.onload = initialize;
+
+    </script>
+</body>
+</html>
